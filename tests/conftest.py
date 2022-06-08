@@ -4,11 +4,13 @@
 import collections
 import pathlib
 import tempfile
+import time
 import uuid
 
 from aiida.common import exceptions
 from aiida.common.folders import Folder
 from aiida.common.links import LinkType
+from aiida.engine import Process, submit
 from aiida.engine.utils import instantiate_process
 from aiida.manage.manager import get_manager
 from aiida.orm import CalcJobNode, Code, Computer, FolderData
@@ -16,6 +18,70 @@ from aiida.plugins import CalculationFactory, ParserFactory
 import pytest
 
 pytest_plugins = ['aiida.manage.tests.pytest_fixtures']  # pylint: disable=invalid-name
+
+
+@pytest.fixture(scope='session')
+def daemon(aiida_profile):  # pylint: disable=unused-argument
+    """Launch the daemon in a subprocess for the current profile.
+
+    The daemon will automatically be shutdown at the end of the session.
+    """
+    import subprocess
+
+    from aiida.cmdline.utils.common import get_env_with_venv_bin
+    from aiida.manage.configuration import get_config
+
+    config = get_config()
+    config.set_option('warnings.development_version', False)
+    config.set_option('warnings.rabbitmq_version', False)
+
+    profile = config.get_profile()
+    default_user = get_manager().get_profile_storage().default_user
+    profile.default_user_email = default_user.email
+    config.store()
+
+    env = get_env_with_venv_bin()
+    subprocess.check_call(['verdi', '-p', profile.name, 'daemon', 'start-circus'], env=env)
+
+    try:
+        yield
+    finally:
+        subprocess.check_call(['verdi', '-p', profile.name, 'daemon', 'stop'], env=env)
+
+
+@pytest.fixture
+def submit_and_wait(daemon):  # pylint: disable=unused-argument
+    """Submit instance of a process to the daemon and wait for it to be terminated."""
+
+    def factory(process_class: Process, timeout: int = 20, sleep_interval: int = 0.2, **kwargs):
+        """Submit instance of a process to the daemon and wait for it to be terminated.
+
+        :param process_class: The :class:`aiida.engine.Process` class to submit.
+        :param timeout: Raise an exception if the process is not terminated after this amount of seconds.
+        :param sleep_interval: The interval in seconds to sleep between checking whether the process is terminated.
+        :raise AssertionError: If the process excepted or failed.
+        :raise AssertionError: If the process did not terminate before the timeout expired.
+        """
+        node = submit(process_class, **kwargs)
+
+        start_time = time.time()
+
+        while not node.is_terminated:
+
+            if time.time() - start_time > timeout:
+                raise AssertionError(f'The process did not terminate before the timeout of {timeout} seconds.')
+
+            time.sleep(sleep_interval)
+
+        if node.is_excepted:
+            raise AssertionError(f'The process excepted: {node.exception}')
+
+        if not node.is_finished_ok:
+            raise AssertionError(f'The process failed with exit status {node.exit_status}: {node.exit_message}')
+
+        return node
+
+    return factory
 
 
 @pytest.fixture
@@ -133,10 +199,17 @@ def generate_computer():
 def generate_code(generate_computer):
     """Return a :class:`aiida.orm.Code` instance, either already existing or created."""
 
-    def factory(computer_label='localhost', label=None, entry_point_name='core.shell', executable='/bin/true'):
+    def factory(command='/bin/true', computer_label='localhost', label=None, entry_point_name='core.shell'):
         """Return a :class:`aiida.orm.Code` instance, either already existing or created."""
         label = label or str(uuid.uuid4())
         computer = generate_computer(computer_label)
+
+        with computer.get_transport() as transport:
+            status, stdout, stderr = transport.exec_command_wait(f'which {command}')
+            executable = stdout.strip()
+
+            if status != 0:
+                raise ValueError(f'failed to determine the absolute path of the command on the computer: {stderr}')
 
         try:
             filters = {'label': label, 'attributes.input_plugin_name': entry_point_name}

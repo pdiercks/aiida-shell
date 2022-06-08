@@ -36,7 +36,33 @@ def launch_shell_job(
     :raises TypeError: If the value specified for ``metadata.options.computer`` is not a ``Computer``.
     :raises ValueError: If the absolute path of the command on the computer could not be determined.
     """
-    computer = prepare_computer((metadata or {}).get('options', {}).pop('computer', None))
+    computer = (metadata or {}).get('options', {}).pop('computer', None)
+    code = prepare_code(command, computer)
+
+    inputs = {
+        'code': code,
+        'nodes': convert_nodes_single_file_data(nodes or {}),
+        'filenames': filenames or {},
+        'arguments': arguments or [],
+        'outputs': outputs or [],
+        'metadata': metadata or {},
+    }
+
+    results, node = run_get_node(CalculationFactory('core.shell'), **inputs)  # type: ignore[arg-type]
+
+    return {label: node for label, node in results.items() if isinstance(node, SinglefileData)}, node
+
+
+def prepare_code(command: str, computer: Computer | None = None) -> Code:
+    """Prepare a code for the given command and computer.
+
+    This will automatically prepare the computer
+
+    :param command: The command that the code should represent. Can be the relative executable name or absolute path.
+    :param computer: The computer on which the command should be run. If not defined the localhost will be used.
+    :return: A :class:`aiida.orm.Code` instance.
+    """
+    computer = prepare_computer(computer)
 
     with computer.get_transport() as transport:
         status, stdout, stderr = transport.exec_command_wait(f'which {command}')
@@ -57,18 +83,7 @@ def launch_shell_job(
             input_plugin_name='core.shell'
         ).store()
 
-    inputs = {
-        'code': code,
-        'nodes': convert_nodes_single_file_data(nodes or {}),
-        'filenames': filenames or {},
-        'arguments': arguments or [],
-        'outputs': outputs or [],
-        'metadata': metadata or {},
-    }
-
-    results, node = run_get_node(CalculationFactory('core.shell'), **inputs)  # type: ignore[arg-type]
-
-    return {label: node for label, node in results.items() if isinstance(node, SinglefileData)}, node
+    return code
 
 
 def prepare_computer(computer: Computer | None = None) -> Computer:
